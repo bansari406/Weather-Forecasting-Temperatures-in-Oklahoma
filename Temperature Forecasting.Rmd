@@ -1,0 +1,727 @@
+Initial Start-Up Processes:
+```{r setup, include=FALSE}
+# Remove all objects from the environment
+rm(list = ls())
+
+#remotes::install_github("ropensci/rnaturalearthhires") # Needed to install "rnaturalearthhires"
+
+# Load necessary user libraries [use "install.packages()" on any not currently installed on the computer]
+library(fpp3)
+library(tidyverse)
+library(readxl)
+library(stats)
+library(forecast)
+library(glue)
+library(broom)
+library(zoo)
+library(tseries)
+library(viridisLite)
+library(randomForest)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rnaturalearthhires)
+
+# Set up chunk for all slides
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = TRUE,
+  dev.args = list(pointsize = 11)
+)
+```
+
+
+Load Dataset
+```{r}
+
+# Load in 2013 - 2023 data collected by weather stations across Oklahoma
+site_data <- read.csv("C:/Users/bushr/OneDrive/Desktop/OK_Site_Data_2013_2023.csv")
+
+# Load in supplemental data that provides feature information on the various individual weather stations
+site_list <- read.csv("C:/Users/bushr/OneDrive/Desktop/Site_List.csv")
+
+
+```
+
+
+Data Pre-Processing
+```{r}
+
+# Save original column types
+original_types <- sapply(site_data, class)
+
+# The values -999, -998, -996, 999, 998, 996, -999.00, -998.00, -996.00, 999.00, 998.00, 996.00 are designated by Mesonet as essentially meaning NA, NaN, or Null values.
+# Replace specific values with NA across all columns using mutate_all()
+site_data_clean <- site_data |>
+  mutate_all(~ ifelse(. %in% c(-999, -998, -996, 999, 998, 996, -999.00, -998.00, -996.00,
+                               999.00, 998.00, 996.00), NA, .))
+
+# Impute all NA values in the dataset (where possible)
+site_data_clean <- na.aggregate(site_data_clean)
+
+# Convert columns back to original types
+site_data_clean <- as.data.frame(site_data_clean)
+
+# Restore original column types
+for (col in names(site_data_clean)) {
+  if (original_types[col] == "numeric") {
+    site_data_clean[[col]] <- as.numeric(site_data_clean[[col]])
+  } else if (original_types[col] == "integer") {
+    site_data_clean[[col]] <- as.integer(site_data_clean[[col]])
+  }
+  else if (original_types[col] == "double") {
+    site_data_clean[[col]] <- as.double(site_data_clean[[col]])
+  }
+  
+}
+
+# Convert year, month, day to Date format
+site_data_clean <- site_data_clean |>
+  mutate(date = as.Date(paste(YEAR, MONTH, DAY, sep = "-")))
+
+# Rename 'stid' column to 'STID'
+colnames(site_list)[colnames(site_list) == "stid"] <- "STID"
+
+# Left join based on site_id between ts_site_data and site_list datasets
+site_data_df <- left_join(site_data_clean, site_list, by = "STID")
+
+# Create tsibble object
+ts_site_data <- as_tsibble(site_data_df, index = date, key = c(STID, cdiv, MONTH, DAY, YEAR))
+
+# Final imputation process
+ts_site_data <- ts_site_data |> fill_gaps()
+
+#Print resulting dataset for review
+print(ts_site_data)
+
+```
+
+Exploratory Data Analysis
+```{r}
+
+# Produce some basic statistics on the dataset
+summary(ts_site_data[, c("TMAX", "TMIN", "TAVG", "DMAX", "DMIN", "DAVG", "HMAX", "HMIN",
+                         "HAVG", "RAIN", "WSPD", "PMAX", "PMIN", "PAVG")])
+
+# Select the desired variables and convert to long format
+site_data_long <- site_data_df |>
+  dplyr::select(TMAX, TMIN, TAVG, DMAX, DMIN, DAVG, HMAX, HMIN, HAVG, RAIN, WSPD, PMAX, PMIN, PAVG, date) |>
+  pivot_longer(cols = -date, names_to = "variable", values_to = "value")
+
+# Plot histograms using ggplot2
+ggplot(site_data_long, aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ variable, scales = "free")
+
+# Plot time series of TMAX, TMIN, TAVG
+ts_site_data |>
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = TMAX), color = "red", alpha = 0.7) +
+  geom_line(aes(y = TMIN), color = "blue", alpha = 0.7) +
+  geom_line(aes(y = TAVG), color = "green", alpha = 0.7) +
+  labs(x = "Date (Day)", y = "Temperature in Fahrenheit", title = "Time Series of Temperature")
+  
+# Check summary and types of selected columns
+columns_to_check <- c("TMAX", "TMIN", "TAVG", "DMAX", "DMIN", "DAVG", "HMAX", "HMIN", "HAVG", "RAIN", "WSPD", "PMAX", "PMIN", "PAVG")
+summary(ts_site_data[, columns_to_check])
+sapply(ts_site_data[, columns_to_check], class)
+
+# Handle NA values by excluding rows with NA
+ts_site_data_imputed <- na.omit(ts_site_data[, columns_to_check])
+
+# Convert columns to numeric if needed using lappy() to apply a specified function to each element of a list
+numeric_columns <- c("TMAX", "TMIN", "TAVG", "DMAX", "DMIN", "DAVG", "HMAX", "HMIN", "HAVG", "RAIN", "WSPD", "PMAX", "PMIN", "PAVG")
+ts_site_data_imputed[, numeric_columns] <- lapply(ts_site_data_imputed[, numeric_columns], as.numeric)
+
+# Compute correlation matrix for selected numeric columns and print
+correlation_matrix <- cor(ts_site_data_imputed[, numeric_columns])
+print(correlation_matrix)
+
+# Create narrowed dataset based on EDA process
+all_ts_site_data <- ts_site_data |> 
+  dplyr::select("STID", "name", "city", "cdir", "cnty", "nlat", "elon", "cdiv", "date", 
+                "MONTH", "DAY", "YEAR","TMAX", "TMIN", "TAVG", "DMAX", "DMIN", "DAVG", 
+                "HMAX", "HMIN", "HAVG", "RAIN", "WSPD", "PMAX", "PMIN", "PAVG")
+
+# Remove any NA values from the dataset to prevent processing issues moving forward
+all_ts_site_data <- na.omit(all_ts_site_data)
+
+# Aggregate all_ts_site_data dataset daily data to monthly data
+all_ts_site_data_monthly <- all_ts_site_data |>
+  index_by(yearmonth = yearmonth(date)) |>
+  group_by(yearmonth) |>
+  summarise(across(
+    c(TMAX, TMIN, TAVG, DMAX, DMIN, DAVG, HMAX, HMIN, HAVG, RAIN, WSPD, PMAX, PMIN, PAVG),
+    mean, na.rm = TRUE
+  ))
+
+# Create new tsibble for just OKCE weather station site
+okc_ts_site_data <- all_ts_site_data |>
+  filter(STID == "OKCE")
+
+# Aggregate okc_ts_site_data dataset daily data to monthly data
+okc_ts_site_data_monthly <- okc_ts_site_data |>
+  index_by(yearmonth = yearmonth(date)) |>
+  group_by(yearmonth) |>
+  summarise(across(
+    c(TMAX, TMIN, TAVG, DMAX, DMIN, DAVG, HMAX, HMIN, HAVG, RAIN, WSPD, PMAX, PMIN, PAVG),
+    mean, na.rm = TRUE
+  ))
+
+okc_ts_site_data_monthly <- okc_ts_site_data_monthly |>
+  fill_gaps()
+
+# Group all_ts_site_data by 'cdiv' and compute summary statistics
+reg_ts_site_data <- all_ts_site_data |>
+  group_by(cdiv) |>
+  summarise(
+    mean_TMAX = mean(TMAX, na.rm = TRUE),
+    mean_TMIN = mean(TMIN, na.rm = TRUE),
+    mean_TAVG = mean(TAVG, na.rm = TRUE),
+    mean_DMAX = mean(DMAX, na.rm = TRUE),
+    mean_DMIN = mean(DMIN, na.rm = TRUE),
+    mean_DAVG = mean(DAVG, na.rm = TRUE),
+    mean_HMAX = mean(HMAX, na.rm = TRUE),
+    mean_HMIN = mean(HMIN, na.rm = TRUE),
+    mean_HAVG = mean(HAVG, na.rm = TRUE),
+    mean_RAIN = mean(RAIN, na.rm = TRUE),
+    mean_WSPD = mean(WSPD, na.rm = TRUE),
+    mean_PMAX = mean(PMAX, na.rm = TRUE),
+    mean_PMIN = mean(PMIN, na.rm = TRUE),
+    mean_PAVG = mean(PAVG, na.rm = TRUE)
+  )
+
+# Aggregate reg_ts_site_data dataset daily data to monthly data
+reg_ts_site_data_monthly <- reg_ts_site_data |>
+  index_by(yearmonth = yearmonth(date)) |>
+  group_by(cdiv) |>
+  summarise(across(
+    c(mean_TMAX, mean_TMIN, mean_TAVG, mean_DMAX, mean_DMIN, mean_DAVG,
+      mean_HMAX, mean_HMIN, mean_HAVG, mean_RAIN, mean_WSPD, mean_PMAX,
+      mean_PMIN, mean_PAVG),
+    mean, na.rm = TRUE
+  ))
+
+# Plot the all_ts_site_data_monthly dataset using gg_season() function
+all_ts_site_data_monthly |>
+  gg_season(TAVG, labels = "both") +
+  ggplot2::scale_color_gradientn(
+    colors = viridis(256, alpha = 1, begin = 0, end = 1, direction = 1, option = "H")
+  )
+
+# Plot the all_ts_site_data_monthly dataset using gg_subseries() function
+all_ts_site_data_monthly |>
+  gg_subseries(TAVG)
+
+# Run the autocorrelation function on all_ts_site_data_monthly dataset and plot the results
+all_ts_site_data_monthly |>
+  ACF() |>
+  autoplot()
+
+# Create a new variable for the ts_site_data_monthly STL decomposition and plot it accordingly
+all_ts_site_data_monthly_dcmp <- all_ts_site_data_monthly |>
+  model(STL(TAVG ~ season(window = 13), robust = TRUE)) |>
+  components()
+all_ts_site_data_monthly_dcmp |>
+  autoplot()
+
+# Plot the reg_ts_site_data_monthly dataset using gg_subseries() function
+reg_ts_site_data_monthly |>
+  gg_subseries(mean_TAVG)
+
+# Run the autocorrelation function on reg_ts_site_data_monthly dataset and plot the results
+reg_ts_site_data_monthly |>
+  ACF() |>
+  autoplot()
+
+# Create a new variable for the reg_ts_site_data_monthly STL decomposition and plot it accordingly
+reg_ts_site_data_monthly_dcmp <- reg_ts_site_data_monthly |>
+  model(STL(mean_TAVG ~ season(window = 13), robust = TRUE)) |>
+  components()
+reg_ts_site_data_monthly_dcmp |>
+  autoplot()
+
+# Plot the okc_ts_site_data_monthly dataset using gg_subseries() function
+okc_ts_site_data_monthly |>
+  gg_subseries(TAVG)
+
+# Run the autocorrelation function on okc_ts_site_data_monthly dataset and plot the results
+okc_ts_site_data_monthly |>
+  ACF() |>
+  autoplot()
+
+# Create a new variable for the okc_ts_site_data_monthly STL decomposition and plot it accordingly
+okc_ts_site_data_monthly_dcmp <- okc_ts_site_data_monthly |>
+  model(STL(TAVG ~ season(window = 13), robust = TRUE)) |>
+  components()
+okc_ts_site_data_monthly_dcmp |>
+  autoplot()
+
+```
+
+Model Selection
+```{r}
+
+# Define train and test/validation sets (70% Training / 30% Testing)
+train_data <- reg_ts_site_data_monthly |> filter(cdiv == "Central", year(yearmonth) < 2020)
+test_data <- reg_ts_site_data_monthly |> filter(cdiv == "Central", year(yearmonth) >= 2020)
+
+
+#----------------------------------Simple Models----------------------------------
+# Create individual models
+naive_model <- train_data |> model(Naive = NAIVE(mean_TAVG))
+snaive_model <- train_data |> model(SNaive = SNAIVE(mean_TAVG))
+drift_model <- train_data |> model(Drift = RW(mean_TAVG ~ drift()))
+
+# Plot the residuals for each model
+naive_model |> gg_tsresiduals()
+snaive_model |> gg_tsresiduals()
+drift_model |> gg_tsresiduals()
+
+# Compute accuracy for each model
+accuracy(naive_model)
+accuracy(snaive_model)
+accuracy(drift_model)
+
+# Generate forecasts using the seasonal naive model
+snaive_forecast <- forecast(snaive_model, h = length(test_data))
+
+# Plot the seasonal naive forecasts
+snaive_forecast |> 
+  autoplot(train_data) + 
+  autolayer(test_data, mean_TAVG, colour = "black") +
+  labs(title = "Forecast of TAVG using seasonal naive method")
+
+
+#----------------------------------Linear Regression Model----------------------------------
+# Fit the linear regression model
+linear_model <- lm(mean_TAVG ~ mean_DAVG, data = train_data)
+
+# Generate forecasts using the linear regression model
+lm_forecast_values <- predict(linear_model, newdata = test_data)
+
+# Convert forecasts to a time series object
+lm_forecast_ts <- ts(lm_forecast_values, start = start(test_data$yearmonth), frequency = 12)
+
+# Convert true values to a time series object
+lm_true_values_ts <- ts(test_data$mean_TAVG, start = start(test_data$yearmonth), frequency = 12)
+
+# Compute accuracy using the 'accuracy()' function
+accuracy(lm_forecast_ts, lm_true_values_ts)
+
+# Convert true values to a time series object
+true_values_ts <- ts(test_data$mean_TAVG, start = start(test_data$yearmonth), frequency = 12)
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  yearmonth = time(true_values_ts),
+  True_Values = as.vector(true_values_ts),
+  Forecast_Values = as.vector(lm_forecast_ts)
+)
+
+# Plot the forecast and true values
+ggplot(plot_data, aes(x = yearmonth)) +
+  geom_line(aes(y = True_Values), color = "black", size = 1) +
+  geom_line(aes(y = Forecast_Values), color = "blue", linetype = "dashed", size = 1) +
+  labs(title = "Forecast of TAVG using linear regression method",
+       y = "TAVG",
+       x = "Month")
+
+
+#------------------------------------ARIMA Model------------------------------------
+# Fit ARIMA model to training data
+arima_model <- Arima(train_data$mean_TAVG, order = c(1, 1, 1))
+
+# Generate forecasts for test/validation data
+arima_forecast_values <- forecast(arima_model, h = length(train_data$mean_TAVG))
+
+# Compute accuracy metrics
+accuracy(arima_forecast_values, train_data$mean_TAVG)
+
+# Convert test_data$mean_TAVG to a time series object for plotting
+arima_test_data_ts <- ts(test_data$mean_TAVG, start = start(test_data$yearmonth), frequency = 12)
+
+# Plot the forecasts and test data
+autoplot(arima_forecast_values) +
+  autolayer(arima_test_data_ts, series = "Test Data") +
+  labs(title = "Forecast of TAVG using ARIMA method")
+
+
+#----------------------------------ETS (A, A, A) Model----------------------------------
+# Fit ETS (A,A,A) model to TAVG
+ets_AAA_model <- train_data |>
+  model(ETS(mean_TAVG ~ error("A") + trend("A") + season("A")))
+
+# Glance/Summary of the ETS model
+glance(ets_AAA_model)
+
+# Generate forecasts using the ETS model
+ets_AAA_forecast_values <- forecast(ets_AAA_model, h = 12 * 4)
+
+# Compute accuracy metrics
+accuracy(ets_AAA_model)
+
+# Plot the forecasts
+ets_AAA_forecast_values |> 
+  autoplot(train_data) + 
+  autolayer(test_data, mean_TAVG, colour = "black") +
+  labs(title = "Forecast of TAVG using ETS (A,A,A) method")
+
+
+#----------------------------------ETS (A, Ad, A) Model----------------------------------
+# Fit ETS (A,Ad,A) model to TAVG
+ets_AAdA_model <- train_data |>
+  model(ETS(mean_TAVG ~ error("A") + trend("Ad") + season("A")))
+
+# Glance/Summary of the ETS model
+glance(ets_AAdA_model)
+
+# Generate forecasts using the ETS model
+ets_AAdA_forecast_values <- forecast(ets_AAdA_model, h = 12 * 4)
+
+# Compute accuracy metrics
+accuracy(ets_AAdA_model)
+
+# Plot the forecasts
+ets_AAdA_forecast_values |> 
+  autoplot(train_data) + 
+  autolayer(test_data, mean_TAVG, colour = "black") +
+  labs(title = "Forecast of TAVG using ETS (A, Ad, A) method")
+
+
+#----------------------------------ETS (M, N, A) Model----------------------------------
+# Fit ETS (M,N,A) model to TAVG
+ets_MNA_model <- train_data |>
+  model(ETS(mean_TAVG ~ error("M") + trend("N") + season("A")))
+
+# Glance/Summary of the ETS model
+glance(ets_MNA_model)
+
+# Generate forecasts using the ETS model
+ets_MNA_forecast_values <- forecast(ets_MNA_model, h = 12 * 4)
+
+# Compute accuracy metrics
+accuracy(ets_MNA_model)
+
+# Plot the forecasts
+ets_MNA_forecast_values |> 
+  autoplot(train_data) + 
+  autolayer(test_data, mean_TAVG, colour = "black") +
+  labs(title = "Forecast of TAVG using ETS (M,N,A) method")
+
+
+#----------------------------------ETS (A, N, A) Model----------------------------------
+# Fit ETS (A,N,A) model to TAVG
+ets_ANA_model <- train_data |>
+  model(ETS(mean_TAVG ~ error("A") + trend("N") + season("A")))
+
+# Glance/Summary of the ETS model
+glance(ets_ANA_model)
+
+# Generate forecasts using the ETS model
+ets_ANA_forecast_values <- forecast(ets_ANA_model, h = 12 * 4)
+
+# Compute accuracy metrics
+accuracy(ets_ANA_model)
+
+# Plot the forecasts
+ets_ANA_forecast_values |> 
+  autoplot(train_data) + 
+  autolayer(test_data, mean_TAVG, colour = "black") +
+  labs(title = "Forecast of TAVG using ETS (A,N,A) method")
+
+
+#----------------------------------Random Forest Model----------------------------------
+# Extract predictors and response variable for random forest
+predictors <- train_data[, c("mean_DAVG")]  # Add more predictors as needed
+response <- train_data$mean_TAVG
+
+# Train the random forest model
+rf_model <- randomForest(response ~ ., data = predictors, ntree = 100)
+
+# Generate forecasts for the test/validation data
+rf_forecast_values <- predict(rf_model, newdata = test_data[, c("mean_DAVG")])
+
+# Convert forecasts to a time series object
+rf_forecast_ts <- ts(rf_forecast_values, start = start(test_data$yearmonth), frequency = 12)
+
+# Convert true values to a time series object
+true_values_ts <- ts(test_data$mean_TAVG, start = start(test_data$yearmonth), frequency = 12)
+
+# Calculate accuracy metrics
+accuracy_metrics <- accuracy(rf_forecast_ts, true_values_ts)
+print(accuracy_metrics)
+
+# Plot the forecasts and true values
+autoplot(rf_forecast_ts) +
+  autolayer(true_values_ts, series = "Test Data") +
+  labs(title = "Forecast of TAVG using Random Forest method",
+       y = "TAVG",
+       x = "Month")
+
+
+#----------------------------------Neural Network Model----------------------------------
+# Fit NNETAR model to mean_TAVG
+nn_model_fit <- train_data |>
+  model(NNETAR(mean_TAVG))
+
+# Glance/Summary of the NNETAR model
+glance(nn_model_fit)
+
+# Generate forecasts using the fitted NNETAR model
+nn_forecast <- nn_model_fit |> forecast(h = 12* 4)
+
+# Compute accuracy metrics
+accuracy(nn_model_fit)
+
+# Plot the forecasts
+nn_forecast |> 
+  autoplot(train_data) +
+  autolayer(test_data, mean_TAVG, colour = "black") +
+  labs(title = "Forecast of TAVG using Neural Network (NNETAR) method")
+
+# Result: Neural network model is the best fit because it had the lowest RSME
+
+```
+
+
+Model Development and Validation
+```{r}
+
+# Adjust number of nodes in the hidden layer
+nn_model_fit_test <- train_data |>
+  model(NNETAR(mean_TAVG, n_nodes = 10, n_networks = 30, scale_inputs = TRUE))
+
+# Glance/Summary of the NNETAR fit model
+glance(nn_model_fit_test)
+
+# Evaluate accuracy of fit
+accuracy(nn_model_fit_test)
+
+# Plot the residuals for the model
+nn_model_fit_test |> gg_tsresiduals()
+
+# Generate forecasts using the tuned NNETAR model
+nn_forecast_test <- nn_model_fit_test |>
+  forecast(h = 12 * 4)
+
+# Plot the NNETAR forecasts
+nn_forecast_test |>
+  autoplot(train_data) +
+  autolayer(test_data, mean_TAVG, colour = "black") +
+  labs(title = "Forecast of TAVG using Neural Network (NNETAR) method")
+
+```
+
+Forecasting
+```{r}
+
+# Create the final datasets to forecast
+ctr_ts_site_data_monthly <- reg_ts_site_data_monthly |> filter(cdiv == "Central")
+nte_ts_site_data_monthly <- reg_ts_site_data_monthly |> filter(cdiv == "Northeast")
+pan_ts_site_data_monthly <- reg_ts_site_data_monthly |> filter(cdiv == "Panhandle")
+ste_ts_site_data_monthly <- reg_ts_site_data_monthly |> filter(cdiv == "Southeast")
+stw_ts_site_data_monthly <- reg_ts_site_data_monthly |> filter(cdiv == "Southwest")
+
+
+#--------------------Central Oklahoma Region Forecasts--------------------------
+# Create neural network model
+nn_model_fit_ctr <- ctr_ts_site_data_monthly |>
+  model(NNETAR(mean_TAVG, n_nodes = 10, n_networks = 30, scale_inputs = TRUE))
+
+# Evaluate accuracy of fit
+accuracy(nn_model_fit_ctr)
+
+# Generate forecasts using the created model
+nn_forecast_ctr <- nn_model_fit_ctr |>
+  forecast(h = 12 * 4)
+
+# Plot the forecasts
+nn_forecast_ctr |>
+  autoplot(ctr_ts_site_data_monthly) +
+  labs(x = "Month", y = "Temperature in Fahrenheit",
+       title = "Neural Network Forecast of Central Oklahoma Region")
+
+
+#--------------------Northeast Oklahoma Region Forecasts--------------------------
+# Create neural network model
+nn_model_fit_nte <- nte_ts_site_data_monthly |>
+  model(NNETAR(mean_TAVG, n_nodes = 10, n_networks = 30, scale_inputs = TRUE))
+
+# Evaluate accuracy of fit
+accuracy(nn_model_fit_nte)
+
+# Generate forecasts using the created model
+nn_forecast_nte <- nn_model_fit_nte |>
+  forecast(h = 12 * 4)
+
+# Plot the forecasts
+nn_forecast_nte |>
+  autoplot(nte_ts_site_data_monthly) +
+  labs(x = "Month", y = "Temperature in Fahrenheit",
+       title = "Neural Network Forecast of Northeast Oklahoma Region")
+
+
+#--------------------Panhandle Oklahoma Region Forecasts--------------------------
+# Create neural network model
+nn_model_fit_pan <- pan_ts_site_data_monthly |>
+  model(NNETAR(mean_TAVG, n_nodes = 10, n_networks = 30, scale_inputs = TRUE))
+
+# Evaluate accuracy of fit
+accuracy(nn_model_fit_pan)
+
+# Generate forecasts using the created model
+nn_forecast_pan <- nn_model_fit_pan |>
+  forecast(h = 12 * 4)
+
+# Plot the forecasts
+nn_forecast_pan |>
+  autoplot(pan_ts_site_data_monthly) +
+  labs(x = "Month", y = "Temperature in Fahrenheit",
+       title = "Neural Network Forecast of Panhandle Oklahoma Region")
+
+
+#--------------------Southeast Oklahoma Region Forecasts--------------------------
+# Create neural network model
+nn_model_fit_ste <- ste_ts_site_data_monthly |>
+  model(NNETAR(mean_TAVG, n_nodes = 10, n_networks = 30, scale_inputs = TRUE))
+
+# Evaluate accuracy of fit
+accuracy(nn_model_fit_ste)
+
+# Generate forecasts using the created model
+nn_forecast_ste <- nn_model_fit_ste |>
+  forecast(h = 12 * 4)
+
+# Plot the forecasts
+nn_forecast_ste |>
+  autoplot(ste_ts_site_data_monthly) +
+  labs(x = "Month", y = "Temperature in Fahrenheit",
+       title = "Neural Network Forecast of Southeast Oklahoma Region")
+
+
+#--------------------Southwest Oklahoma Region Forecasts--------------------------
+# Create neural network model
+nn_model_fit_stw <- stw_ts_site_data_monthly |>
+  model(NNETAR(mean_TAVG, n_nodes = 10, n_networks = 30, scale_inputs = TRUE))
+
+# Evaluate accuracy of fit
+accuracy(nn_model_fit_stw)
+
+# Generate forecasts using the created model
+nn_forecast_stw <- nn_model_fit_stw |>
+  forecast(h = 12 * 4)
+
+# Plot the forecasts
+nn_forecast_stw |>
+  autoplot(stw_ts_site_data_monthly) +
+  labs(x = "Month", y = "Temperature in Fahrenheit",
+       title = "Neural Network Forecast of Southwest Oklahoma Region")
+
+```
+
+
+Other Analysis and Charts/Plots (as necessary)
+```{r}
+
+# Setup variables to use "rnaturalearth" series of libraries
+
+# Load state boundaries for the United States
+states <- ne_states(country = "United States of America", returnclass = "sf")
+
+# Filter for Oklahoma
+oklahoma <- states[states$name == "Oklahoma", ]
+
+
+#--------------------Locations of All Weather Stations in Oklahoma--------------------
+# Plot state boundaries of Oklahoma overlayed with the weather station locations
+all_map_plot <- ggplot() +
+  geom_sf(data = oklahoma, fill = NA, color = "black") +  # Oklahoma boundaries
+  geom_point(data = all_ts_site_data, aes(x = elon, y = nlat), color = "red", size = 3) +
+  labs(x = "Longitude", y = "Latitude", title = "Weather Station Locations in All of Oklahoma") +
+  theme_minimal()
+
+# Print the map plot
+print(all_map_plot)
+
+
+#-------------------Locations of Weather Stations in Central Oklahoma-------------------
+# Plot state boundaries of Oklahoma overlayed with the weather station locations
+ctr_map_plot <- ggplot() +
+  geom_sf(data = oklahoma, fill = NA, color = "black") +  # Oklahoma boundaries
+  geom_point(data = all_ts_site_data |> 
+               filter(cdiv == "Central"),
+             aes(x = elon, y = nlat), color = "red", size = 3) +
+  labs(x = "Longitude", y = "Latitude", title = "Weather Station Locations in Central Oklahoma") +
+  theme_minimal()
+
+# Print the map plot
+print(ctr_map_plot)
+
+
+#-------------------Locations of Weather Stations in NE Oklahoma-------------------
+# Plot state boundaries of Oklahoma overlayed with the weather station locations
+nte_map_plot <- ggplot() +
+  geom_sf(data = oklahoma, fill = NA, color = "black") +  # Oklahoma boundaries
+  geom_point(data = all_ts_site_data |> 
+               filter(cdiv == "Northeast"),
+             aes(x = elon, y = nlat), color = "red", size = 3) +
+  labs(x = "Longitude", y = "Latitude", title = "Weather Station Locations in NE Oklahoma") +
+  theme_minimal()
+
+# Print the map plot
+print(nte_map_plot)
+
+
+#--------------Locations of Weather Stations in NW (Panhandle) Oklahoma--------------
+# Plot state boundaries of Oklahoma overlayed with the weather station locations
+pan_map_plot <- ggplot() +
+  geom_sf(data = oklahoma, fill = NA, color = "black") +  # Oklahoma boundaries
+  geom_point(data = all_ts_site_data |> 
+               filter(cdiv == "Panhandle"),
+             aes(x = elon, y = nlat), color = "red", size = 3) +
+  labs(x = "Longitude", y = "Latitude", title = "Weather Station Locations in NW Oklahoma (Panhandle)") +
+  theme_minimal()
+
+# Print the map plot
+print(pan_map_plot)
+
+
+#-------------------Locations of Weather Stations in SE Oklahoma-------------------
+# Plot state boundaries of Oklahoma overlayed with the weather station locations
+ste_map_plot <- ggplot() +
+  geom_sf(data = oklahoma, fill = NA, color = "black") +  # Oklahoma boundaries
+  geom_point(data = all_ts_site_data |> 
+               filter(cdiv == "Southeast"),
+             aes(x = elon, y = nlat), color = "red", size = 3) +
+  labs(x = "Longitude", y = "Latitude", title = "Weather Station Locations in SE Oklahoma") +
+  theme_minimal()
+
+# Print the map plot
+print(ste_map_plot)
+
+
+#-------------------Locations of Weather Stations in SW Oklahoma-------------------
+# Plot state boundaries of Oklahoma overlayed with the weather station locations
+stw_map_plot <- ggplot() +
+  geom_sf(data = oklahoma, fill = NA, color = "black") +  # Oklahoma boundaries
+  geom_point(data = all_ts_site_data |> 
+               filter(cdiv == "Southwest"),
+             aes(x = elon, y = nlat), color = "red", size = 3) +
+  labs(x = "Longitude", y = "Latitude", title = "Weather Station Locations in SW Oklahoma") +
+  theme_minimal()
+
+# Print the map plot
+print(stw_map_plot)
+
+```
+
+
+
+
+
+
+
+
